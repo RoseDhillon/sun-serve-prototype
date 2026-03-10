@@ -6,6 +6,7 @@ const {
   getTicket,
   updateTicket,
   deleteTicket,
+  closeTicket,
 } = require("../controllers/ticketController")
 const { protect } = require("../middleware/auth")
 const { authorize } = require("../middleware/authorize")
@@ -25,5 +26,8 @@ router
   .get(getTicket)
   .put(updateTicket)
   .delete(authorize(USER_ROLES.ADMIN), deleteTicket)
+
+// Close ticket
+router.post("/:id/close", authorize(USER_ROLES.TECHNICIAN, USER_ROLES.MANAGER, USER_ROLES.ADMIN), closeTicket)
 
 module.exports = router

@@ -1,57 +1,69 @@
 const ServiceTicket = require("../models/ServiceTicket")
 
+// Helper to allow only specific fields from body
+const pick = (obj, fields) =>
+  fields.reduce((acc, f) => {
+    if (obj[f] !== undefined) acc[f] = obj[f]
+    return acc
+  }, {})
+
 // @desc    Create new service ticket
 // @route   POST /api/tickets
 // @access  Private
 exports.createTicket = async (req, res, next) => {
   try {
-    // Add creator from authenticated user
-    req.body.createdBy = req.user.id
+    const allowed = [
+      "title",
+      "description",
+      "category",
+      "priority",
+      "relatedInstallation",
+      "relatedMaintenance",
+    ]
 
-    const ticket = await ServiceTicket.create(req.body)
+    const payload = pick(req.body, allowed)
+    payload.createdBy = req.user.id
 
-    res.status(201).json({
-      success: true,
-      message: "Service ticket created successfully",
-      data: ticket,
-    })
+    const ticket = await ServiceTicket.create(payload)
+
+    res.status(201).json({ success: true, message: "Service ticket created", data: ticket })
   } catch (error) {
     next(error)
   }
 }
 
-// @desc    Get all service tickets
+// @desc    Get all service tickets (with pagination & filters)
 // @route   GET /api/tickets
 // @access  Private
 exports.getTickets = async (req, res, next) => {
   try {
-    let query
+    const page = parseInt(req.query.page, 10) || 1
+    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100)
+    const skip = (page - 1) * limit
 
-    // If user is customer, only show their tickets
-    if (req.user.role === "customer") {
-      query = ServiceTicket.find({ createdBy: req.user.id })
-    }
-    // If user is technician, show assigned tickets
-    else if (req.user.role === "technician") {
-      query = ServiceTicket.find({ assignedTo: req.user.id })
-    }
-    // Admin and Manager see all
-    else {
-      query = ServiceTicket.find()
-    }
+    // Base filter depending on role
+    let filter = {}
+    if (req.user.role === "customer") filter.createdBy = req.user.id
+    else if (req.user.role === "technician") filter.assignedTo = req.user.id
 
-    const tickets = await query
-      .populate("createdBy", "name email")
-      .populate("assignedTo", "name email")
-      .populate("relatedInstallation", "address")
-      .populate("relatedMaintenance", "description")
-      .sort("-createdAt")
+    // Additional filters
+    if (req.query.status) filter.status = req.query.status
+    if (req.query.priority) filter.priority = req.query.priority
+    if (req.query.assignedTo) filter.assignedTo = req.query.assignedTo
 
-    res.status(200).json({
-      success: true,
-      count: tickets.length,
-      data: tickets,
-    })
+    const [count, tickets] = await Promise.all([
+      ServiceTicket.countDocuments(filter),
+      ServiceTicket.find(filter)
+        .populate("createdBy", "name email")
+        .populate("assignedTo", "name email")
+        .populate("relatedInstallation", "address")
+        .populate("relatedMaintenance", "description")
+        .sort(req.query.sort || "-createdAt")
+        .skip(skip)
+        .limit(limit),
+    ])
+
+    res.status(200).json({ success: true, count, page, pageSize: tickets.length, data: tickets })
   } catch (error) {
     next(error)
   }
@@ -68,17 +80,25 @@ exports.getTicket = async (req, res, next) => {
       .populate("relatedInstallation")
       .populate("relatedMaintenance")
 
-    if (!ticket) {
-      return res.status(404).json({
-        success: false,
-        error: "Service ticket not found",
-      })
-    }
+    if (!ticket) return res.status(404).json({ success: false, error: "Service ticket not found" })
 
-    res.status(200).json({
-      success: true,
-      data: ticket,
-    })
+    res.status(200).json({ success: true, data: ticket })
+  } catch (error) {
+    next(error)
+  }
+}
+
+// @desc    Close a service ticket
+// @route   POST /api/tickets/:id/close
+// @access  Private (Technician/Manager/Admin)
+exports.closeTicket = async (req, res, next) => {
+  try {
+    const ticket = await ServiceTicket.findById(req.params.id)
+    if (!ticket) return res.status(404).json({ success: false, error: "Service ticket not found" })
+
+    const resolution = req.body.resolution || req.body.note || undefined
+    const closed = await ticket.close(resolution)
+    res.status(200).json({ success: true, message: "Service ticket closed", data: closed })
   } catch (error) {
     next(error)
   }
@@ -89,30 +109,23 @@ exports.getTicket = async (req, res, next) => {
 // @access  Private
 exports.updateTicket = async (req, res, next) => {
   try {
-    let ticket = await ServiceTicket.findById(req.params.id)
+    const ticket = await ServiceTicket.findById(req.params.id)
+    if (!ticket) return res.status(404).json({ success: false, error: "Service ticket not found" })
 
-    if (!ticket) {
-      return res.status(404).json({
-        success: false,
-        error: "Service ticket not found",
-      })
-    }
+    const allowed = ["title", "description", "category", "priority", "status", "assignedTo", "resolution"]
+    const payload = pick(req.body, allowed)
 
     // If ticket is being closed, set closedAt
-    if (req.body.status === "closed" && ticket.status !== "closed") {
-      req.body.closedAt = Date.now()
+    if (payload.status && payload.status.toLowerCase() === "closed" && ticket.status !== "closed") {
+      payload.closedAt = Date.now()
     }
 
-    ticket = await ServiceTicket.findByIdAndUpdate(req.params.id, req.body, {
+    const updated = await ServiceTicket.findByIdAndUpdate(req.params.id, payload, {
       new: true,
       runValidators: true,
     })
 
-    res.status(200).json({
-      success: true,
-      message: "Service ticket updated successfully",
-      data: ticket,
-    })
+    res.status(200).json({ success: true, message: "Service ticket updated", data: updated })
   } catch (error) {
     next(error)
   }
@@ -124,21 +137,10 @@ exports.updateTicket = async (req, res, next) => {
 exports.deleteTicket = async (req, res, next) => {
   try {
     const ticket = await ServiceTicket.findById(req.params.id)
-
-    if (!ticket) {
-      return res.status(404).json({
-        success: false,
-        error: "Service ticket not found",
-      })
-    }
+    if (!ticket) return res.status(404).json({ success: false, error: "Service ticket not found" })
 
     await ticket.deleteOne()
-
-    res.status(200).json({
-      success: true,
-      message: "Service ticket deleted successfully",
-      data: {},
-    })
+    res.status(200).json({ success: true, message: "Service ticket deleted" })
   } catch (error) {
     next(error)
   }
